@@ -5,7 +5,7 @@ local ADDON_NAME, ns = ...
 --------------------------------------------------------------------------------
 local MSG_PREFIX    = "FMG"
 local MACRO_NAME    = "FMG Focus"
-local MACRO_BODY    = "/focus"
+local MACRO_BODY    = "/focus [@mouseover,exists,nodead]\n/target [@mouseover,exists,nodead]\n/tm %d\n/targetlasttarget"
 local NEGOTIATE_SEC = 2
 
 local MARKERS = {
@@ -65,16 +65,17 @@ local function UpdateMacro(iconIndex)
     end
 
     local icon = MARKERS[iconIndex].icon
+    local body = string.format(MACRO_BODY, iconIndex)
     local idx  = GetMacroIndexByName(MACRO_NAME)
 
     if idx > 0 then
-        EditMacro(idx, MACRO_NAME, icon, MACRO_BODY)
+        EditMacro(idx, MACRO_NAME, icon, body)
     else
         local numGlobal, numChar = GetNumMacros()
         if numGlobal < MAX_ACCOUNT_MACROS then
-            CreateMacro(MACRO_NAME, icon, MACRO_BODY, false)
+            CreateMacro(MACRO_NAME, icon, body, false)
         elseif numChar < MAX_CHARACTER_MACROS then
-            CreateMacro(MACRO_NAME, icon, MACRO_BODY, true)
+            CreateMacro(MACRO_NAME, icon, body, true)
         else
             Print("No macro slots available — delete one and type |cffffff00/fmg reset|r")
             return false
