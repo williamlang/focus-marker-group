@@ -5,8 +5,9 @@ local ADDON_NAME, ns = ...
 --------------------------------------------------------------------------------
 local MSG_PREFIX    = "FMG"
 local MACRO_NAME    = "FMG Focus"
-local MACRO_BODY    = "/focus [@mouseover,exists,nodead]\n/target [@mouseover,exists,nodead]\n/tm %d\n/targetlasttarget"
 local NEGOTIATE_SEC = 2
+
+local DEFAULT_MACRO_BODY = "/focus [@mouseover,exists,nodead]\n/target [@mouseover,exists,nodead]\n/tm %d\n/targetlasttarget"
 
 local MARKERS = {
     { name = "Star",     icon = "Interface\\TargetingFrame\\UI-RaidTargetingIcon_1", rt = "{rt1}" },
@@ -27,6 +28,7 @@ local claims       = {}        -- [playerName] = iconIndex
 local inDungeon    = false
 local negotiating  = false
 local pendingIcon  = nil       -- deferred macro update (combat lockdown)
+local optCategory  = nil       -- Settings category handle
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -56,6 +58,32 @@ local function IsInDungeonInstance()
 end
 
 --------------------------------------------------------------------------------
+-- Config helpers
+--------------------------------------------------------------------------------
+local function GetMacroBody()
+    return FocusMarkerGroupDB and FocusMarkerGroupDB.macroBody or DEFAULT_MACRO_BODY
+end
+
+local function ValidateMacroBody(text)
+    -- require literal "/tm %d" somewhere in the body
+    return string.find(text, "/tm %%d") ~= nil
+end
+
+--------------------------------------------------------------------------------
+-- Resolve texture paths → fileDataIDs (fixes drag-to-actionbar)
+--------------------------------------------------------------------------------
+local function ResolveMarkerIcons()
+    local tex = UIParent:CreateTexture(nil, "BACKGROUND")
+    for i, marker in ipairs(MARKERS) do
+        tex:SetTexture(marker.icon)
+        marker.iconID = tex:GetTextureFileID()
+    end
+    tex:Hide()
+    tex:ClearAllPoints()
+    tex:SetParent(nil)
+end
+
+--------------------------------------------------------------------------------
 -- Macro management (protected, must be out of combat)
 --------------------------------------------------------------------------------
 local function UpdateMacro(iconIndex)
@@ -64,18 +92,18 @@ local function UpdateMacro(iconIndex)
         return true
     end
 
-    local icon = MARKERS[iconIndex].icon
-    local body = string.format(MACRO_BODY, iconIndex)
-    local idx  = GetMacroIndexByName(MACRO_NAME)
+    local iconID = MARKERS[iconIndex].iconID or MARKERS[iconIndex].icon
+    local body   = GetMacroBody():gsub("%%d", tostring(iconIndex))
+    local idx    = GetMacroIndexByName(MACRO_NAME)
 
     if idx > 0 then
-        EditMacro(idx, MACRO_NAME, icon, body)
+        EditMacro(idx, MACRO_NAME, iconID, body)
     else
         local numGlobal, numChar = GetNumMacros()
         if numGlobal < MAX_ACCOUNT_MACROS then
-            CreateMacro(MACRO_NAME, icon, body, false)
+            CreateMacro(MACRO_NAME, iconID, body, false)
         elseif numChar < MAX_CHARACTER_MACROS then
-            CreateMacro(MACRO_NAME, icon, body, true)
+            CreateMacro(MACRO_NAME, iconID, body, true)
         else
             Print("No macro slots available — delete one and type |cffffff00/fmg reset|r")
             return false
@@ -100,7 +128,16 @@ local function LowestAvailableIcon()
     return nil
 end
 
+local function AnnounceToParty(iconIndex)
+    if IsInGroup() then
+        local marker = MARKERS[iconIndex]
+        local channel = IsInRaid() and "RAID" or "PARTY"
+        SendChatMessage("FocusMarkerGroup: I am " .. marker.rt .. " " .. marker.name, channel)
+    end
+end
+
 local function ClaimIcon(iconIndex)
+    local changed = myIcon ~= iconIndex
     myIcon = iconIndex
     claims[MyName()] = iconIndex
     Send("CLAIM:" .. iconIndex)
@@ -108,6 +145,10 @@ local function ClaimIcon(iconIndex)
     if UpdateMacro(iconIndex) then
         Print("You are " .. IconStr(iconIndex, 16) .. " " .. MARKERS[iconIndex].name
               .. "  — macro |cfffff569'" .. MACRO_NAME .. "'|r updated.")
+    end
+
+    if changed then
+        AnnounceToParty(iconIndex)
     end
 end
 
@@ -190,11 +231,107 @@ local function CleanupStaleClaims()
 end
 
 --------------------------------------------------------------------------------
+-- Options panel  (Interface → Options → Addons → FocusMarkerGroup)
+--------------------------------------------------------------------------------
+local function CreateOptionsPanel()
+    local panel = CreateFrame("Frame")
+    panel:Hide()
+
+    -- Title
+    local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 16, -16)
+    title:SetText("FocusMarkerGroup")
+
+    -- Description
+    local desc = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
+    desc:SetJustifyH("LEFT")
+    desc:SetWidth(460)
+    desc:SetText(
+        "Customize your focus macro body below.\n"
+        .. "|cffffffccThe macro must contain|r |cffffff00/tm %d|r |cffffffcc(replaced with your marker number).|r"
+    )
+
+    -- Background for the edit area
+    local bg = CreateFrame("Frame", nil, panel, "BackdropTemplate")
+    bg:SetSize(470, 160)
+    bg:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", -4, -12)
+    bg:SetBackdrop({
+        bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    bg:SetBackdropColor(0, 0, 0, 0.75)
+    bg:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+
+    -- Scroll frame + edit box
+    local scroll = CreateFrame("ScrollFrame", "FMGMacroScroll", bg, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", 8, -8)
+    scroll:SetPoint("BOTTOMRIGHT", -28, 8)
+
+    local editBox = CreateFrame("EditBox", "FMGMacroEditBox", scroll)
+    editBox:SetMultiLine(true)
+    editBox:SetAutoFocus(false)
+    editBox:SetFontObject("ChatFontNormal")
+    editBox:SetWidth(420)
+    editBox:SetHeight(300)
+    editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    scroll:SetScrollChild(editBox)
+
+    -- Status text (below the edit area)
+    local status = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    status:SetPoint("TOPLEFT", bg, "BOTTOMLEFT", 4, -10)
+    status:SetJustifyH("LEFT")
+
+    -- Save button
+    local saveBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    saveBtn:SetSize(80, 24)
+    saveBtn:SetPoint("TOPLEFT", status, "BOTTOMLEFT", 0, -8)
+    saveBtn:SetText("Save")
+    saveBtn:SetScript("OnClick", function()
+        local text = editBox:GetText()
+        if not ValidateMacroBody(text) then
+            status:SetText("|cffff4444Error: macro must contain /tm %d|r")
+            return
+        end
+        FocusMarkerGroupDB.macroBody = text
+        status:SetText("|cff44ff44Saved!|r")
+        if myIcon then UpdateMacro(myIcon) end
+    end)
+
+    -- Defaults button
+    local defaultsBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    defaultsBtn:SetSize(80, 24)
+    defaultsBtn:SetPoint("LEFT", saveBtn, "RIGHT", 8, 0)
+    defaultsBtn:SetText("Defaults")
+    defaultsBtn:SetScript("OnClick", function()
+        editBox:SetText(DEFAULT_MACRO_BODY)
+        FocusMarkerGroupDB.macroBody = DEFAULT_MACRO_BODY
+        status:SetText("|cff44ff44Defaults restored.|r")
+        if myIcon then UpdateMacro(myIcon) end
+    end)
+
+    -- Refresh edit box text when panel is shown
+    panel:SetScript("OnShow", function()
+        editBox:SetText(GetMacroBody())
+        status:SetText("")
+    end)
+
+    -- Register with the Addon settings system
+    local category = Settings.RegisterCanvasLayoutCategory(panel, "FocusMarkerGroup")
+    category.ID = ADDON_NAME
+    Settings.RegisterAddOnCategory(category)
+    optCategory = category
+end
+
+--------------------------------------------------------------------------------
 -- Event frame
 --------------------------------------------------------------------------------
 local f = CreateFrame("Frame")
 C_ChatInfo.RegisterAddonMessagePrefix(MSG_PREFIX)
 
+f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("ZONE_CHANGED_NEW_AREA")
@@ -204,9 +341,26 @@ f:RegisterEvent("PLAYER_REGEN_ENABLED")
 
 f:SetScript("OnEvent", function(self, event, ...)
 
+    ------------------------------------------------------------------ init
+    if event == "ADDON_LOADED" then
+        local loaded = ...
+        if loaded ~= ADDON_NAME then return end
+
+        -- SavedVariables
+        if not FocusMarkerGroupDB then FocusMarkerGroupDB = {} end
+        if not FocusMarkerGroupDB.macroBody then
+            FocusMarkerGroupDB.macroBody = DEFAULT_MACRO_BODY
+        end
+
+        -- Resolve texture paths → numeric fileDataIDs for macro icons
+        ResolveMarkerIcons()
+
+        self:UnregisterEvent("ADDON_LOADED")
+
     ------------------------------------------------------------------ boot
-    if event == "PLAYER_LOGIN" then
-        Print("Loaded — enter a dungeon to get your focus marker.")
+    elseif event == "PLAYER_LOGIN" then
+        CreateOptionsPanel()
+        Print("Loaded — enter a dungeon to get your focus marker.  |cffffff00/fmg config|r for options.")
 
     ------------------------------------------------------------------ zone
     elseif event == "PLAYER_ENTERING_WORLD"
@@ -254,8 +408,8 @@ f:SetScript("OnEvent", function(self, event, ...)
                     claims[who] = icon
                     myIcon = nil
                     Print(who .. " has priority for " .. MARKERS[icon].name .. " — reassigning…")
-                    local next = LowestAvailableIcon()
-                    if next then ClaimIcon(next) end
+                    local newIcon = LowestAvailableIcon()
+                    if newIcon then ClaimIcon(newIcon) end
                 else
                     Send("CLAIM:" .. myIcon)   -- re-assert
                 end
@@ -325,7 +479,12 @@ SlashCmdList["FMG"] = function(input)
             Print("You must be in a dungeon to reassign markers.")
         end
 
+    elseif cmd == "config" or cmd == "options" then
+        if optCategory then
+            Settings.OpenToCategory(optCategory.ID)
+        end
+
     else
-        Print("Usage: |cfffff569/fmg|r [status | reset]")
+        Print("Usage: |cffffff00/fmg|r [status | reset | config]")
     end
 end
