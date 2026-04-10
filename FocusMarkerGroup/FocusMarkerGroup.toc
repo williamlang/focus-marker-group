@@ -1,0 +1,7 @@
+## Interface: 120000
+## Title: FocusMarkerGroup
+## Notes: Assigns unique raid marker icons to party members' focus macros in dungeons.
+## Version: 1.0.0
+## IconTexture: Interface\TargetingFrame\UI-RaidTargetingIcon_1
+
+FocusMarkerGroup.lua
